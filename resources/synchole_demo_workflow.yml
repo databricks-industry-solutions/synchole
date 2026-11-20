@@ -1,0 +1,16 @@
+resources:
+  jobs:
+    demo_workflow:
+      name: "SyncHole - Smoke Test (${var.environment})"
+      description: Installs the synchole wheel the bundle builds and runs the unit tests on serverless compute.
+      environments:
+        - environment_key: synchole
+          spec:
+            environment_version: "5"
+            dependencies:
+              - ../dist/*.whl
+      tasks:
+        - task_key: smoke_test
+          environment_key: synchole
+          notebook_task:
+            notebook_path: ../tests/run_in_databricks.py

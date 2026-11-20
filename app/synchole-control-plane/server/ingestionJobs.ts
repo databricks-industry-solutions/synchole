@@ -1,0 +1,304 @@
+import type { jobs } from '@databricks/sdk-experimental';
+import { toRunAs, type JobPayload, type JobSettings } from './schemas.js';
+import { workspace, workspaceBaseUrl } from './sql.js';
+import {
+  cdcPipelineName,
+  groupNeedsCdcPipeline,
+  ensureCdcPipeline,
+  plannerNotebookPath,
+  workerNotebookPath,
+  selectiveRefreshNotebookPath,
+} from './pipelines.js';
+import { logger, serializeError } from './logging.js';
+import { gitSource, notebookTask, readLibrary, readNotebooks, syncholeRequirement } from './jobSource.js';
+import {
+  findLocationJob,
+  jobCompute,
+  readJobCompute,
+  readRequirement,
+  runAsIdentity,
+  runAsTarget,
+} from './jobCompute.js';
+
+const jobName = (ingestionGroup: string) => `[${ingestionGroup}] Ingestion Pipeline`;
+
+/** Creates or updates the group's job (and its CDC pipeline when the group needs one). */
+export async function saveJob(body: JobPayload) {
+  const dependency = syncholeRequirement(body.notebooks, body.library);
+  const hasIncrementalSources = await groupNeedsCdcPipeline(body.catalog, body.schema, body.ingestionGroup);
+  const cdcPipelineId = hasIncrementalSources
+    ? await ensureCdcPipeline({
+        pipelineId: body.cdcPipelineId,
+        catalog: body.catalog,
+        schema: body.schema,
+        ingestionGroup: body.ingestionGroup,
+        dependency,
+        compute: body.pipelineCompute,
+        runAs: toRunAs(body.runAs.pipeline.mode === 'SAME_AS_JOB' ? body.runAs.job : body.runAs.pipeline),
+      })
+    : undefined;
+  const name = jobName(body.ingestionGroup);
+  const jobRunAs = toRunAs(body.runAs.job);
+  const configurationFqn = `${body.catalog}.${body.schema}.jdbc_ingestion_config`;
+  const watermarkFqn = `${body.catalog}.${body.schema}.jdbc_ingestion_watermark`;
+  const compute = jobCompute(body.compute, dependency);
+  const taskCompute = compute.task;
+  const tasks: jobs.Task[] = [
+    {
+      task_key: 'ingestion_configs',
+      notebook_task: notebookTask(body.notebooks, plannerNotebookPath),
+      ...taskCompute,
+    },
+    {
+      task_key: 'ingestion_worker',
+      depends_on: [{ task_key: 'ingestion_configs' }],
+      for_each_task: {
+        inputs: '{{tasks.ingestion_configs.values.table_configs}}',
+        concurrency: body.foreachConcurrency,
+        task: {
+          task_key: 'ingestion_worker_iteration',
+          ...taskCompute,
+          notebook_task: {
+            ...notebookTask(body.notebooks, workerNotebookPath),
+            base_parameters: {
+              source_table_name: '{{input.source_table_name}}',
+              full_refresh: '{{job.parameters.full_refresh}}',
+            },
+          },
+        },
+      },
+    },
+  ];
+  if (cdcPipelineId) {
+    // Starting a notebook takes a while: run the refresh only when the planner flagged tables for it.
+    tasks.push({
+      task_key: 'has_full_refresh_targets',
+      depends_on: [{ task_key: 'ingestion_worker' }],
+      condition_task: {
+        op: 'GREATER_THAN',
+        left: '{{tasks.ingestion_configs.values.full_refresh_count}}',
+        right: '0',
+      },
+    });
+    tasks.push({
+      task_key: 'selective_pipeline_refresh',
+      depends_on: [{ task_key: 'has_full_refresh_targets', outcome: 'true' }],
+      ...taskCompute,
+      notebook_task: {
+        ...notebookTask(body.notebooks, selectiveRefreshNotebookPath),
+        base_parameters: {
+          cdc_pipeline_id: cdcPipelineId,
+        },
+      },
+    });
+    tasks.push({
+      task_key: 'cdc_scd2_pipeline',
+      // Runs after the refresh, or right away when the refresh is skipped.
+      depends_on: [
+        { task_key: 'has_full_refresh_targets', outcome: 'false' },
+        { task_key: 'selective_pipeline_refresh' },
+      ],
+      run_if: 'NONE_FAILED',
+      pipeline_task: { pipeline_id: cdcPipelineId, full_refresh: false },
+    });
+  }
+  // performance_target is job-wide and applies to every serverless task, including a serverless pipeline task.
+  const serverlessPipelineTask = Boolean(cdcPipelineId) && body.pipelineCompute.mode === 'SERVERLESS';
+  const settings: jobs.JobSettings = {
+    name,
+    max_concurrent_runs: 1,
+    ...(body.compute.mode === 'SERVERLESS' || serverlessPipelineTask
+      ? { performance_target: body.compute.performanceTarget }
+      : {}),
+    ...compute.settings,
+    parameters: [
+      { name: 'configuration_fqn', default: configurationFqn },
+      { name: 'watermark_fqn', default: watermarkFqn },
+      { name: 'ingestion_group', default: body.ingestionGroup },
+      { name: 'full_refresh', default: 'false' },
+    ],
+    tasks,
+    ...(jobRunAs ? { run_as: jobRunAs } : {}),
+    // Notebooks in the workspace need no git_source.
+    ...(gitSource(body.notebooks) ? { git_source: gitSource(body.notebooks) } : {}),
+    ...(body.schedule.enabled
+      ? {
+          schedule: {
+            quartz_cron_expression: body.schedule.quartzCronExpression,
+            timezone_id: body.schedule.timezoneId,
+            pause_status: body.schedule.pauseStatus,
+          },
+        }
+      : {}),
+  };
+  const existing = [];
+  for await (const job of workspace.jobs.list({ name, limit: 25, expand_tasks: false })) {
+    if (job.settings?.name === name) existing.push(job);
+  }
+  const existingJobId = existing[0]?.job_id;
+  let jobId = existingJobId;
+  if (existingJobId) {
+    await workspace.jobs.reset({ job_id: existingJobId, new_settings: settings });
+  } else {
+    jobId = (await workspace.jobs.create(settings as jobs.CreateJob)).job_id;
+  }
+  const action: 'created' | 'updated' = existingJobId ? 'updated' : 'created';
+  logger.info('jobs.saved', {
+    action,
+    jobId,
+    name,
+    ingestionGroup: body.ingestionGroup,
+    cdcPipelineId,
+    computeMode: body.compute.mode,
+    notebookSource: body.notebooks.source,
+    librarySource: body.library.source,
+    jobRunAs: body.runAs.job.mode,
+    pipelineRunAs: body.runAs.pipeline.mode,
+  });
+  return { jobId, pipelineId: cdcPipelineId, action };
+}
+
+const defaultSchedule = {
+  enabled: false,
+  quartzCronExpression: '0 0 8 * * ?',
+  timezoneId: 'America/New_York',
+  pauseStatus: 'UNPAUSED',
+} as const;
+
+/**
+ * The jobs of a page of ingestion groups at a location, each with its last 10 runs, and the groups that have no
+ * job yet. Jobs are found by name, so the cost follows the page size, not the number of jobs in the workspace.
+ */
+export async function listGroupJobs(catalog: string, schema: string, ingestionGroups: string[]) {
+  const configurationFqn = `${catalog}.${schema}.jdbc_ingestion_config`;
+  const workspaceUrl = workspaceBaseUrl();
+  const jobsFound = [];
+  const missing: string[] = [];
+  for (let offset = 0; offset < ingestionGroups.length; offset += 8) {
+    const batch = ingestionGroups.slice(offset, offset + 8);
+    const found = await Promise.all(
+      batch.map(async (ingestionGroup) => {
+        const job = await findLocationJob(jobName(ingestionGroup), configurationFqn);
+        if (!job?.job_id) return { ingestionGroup, job: undefined };
+        const runs = [];
+        for await (const run of workspace.jobs.listRuns({ job_id: job.job_id, limit: 10, expand_tasks: false })) {
+          runs.push({
+            run_id: run.run_id,
+            run_url: run.run_id ? `${workspaceUrl}/jobs/${job.job_id}/runs/${run.run_id}` : undefined,
+            run_name: run.run_name,
+            start_time: run.start_time,
+            end_time: run.end_time,
+            setup_duration: run.setup_duration,
+            execution_duration: run.execution_duration,
+            cleanup_duration: run.cleanup_duration,
+            state: run.state,
+          });
+          if (runs.length >= 10) break;
+        }
+        return {
+          ingestionGroup,
+          job: {
+            job_id: job.job_id,
+            settings: { name: job.settings?.name, schedule: job.settings?.schedule },
+            creator_user_name: job.creator_user_name,
+            created_time: job.created_time,
+            ingestion_group: ingestionGroup,
+            workspace_url: `${workspaceUrl}/jobs/${job.job_id}`,
+            runs,
+          },
+        };
+      })
+    );
+    for (const item of found) {
+      if (item.job) jobsFound.push(item.job);
+      else missing.push(item.ingestionGroup);
+    }
+  }
+  logger.debug('jobs.listed', { catalog, schema, groups: ingestionGroups.length, jobs: jobsFound.length });
+  return { jobs: jobsFound, missing };
+}
+
+/**
+ * Reads back the settings a group's job was generated from, so they can be exported and re-created elsewhere.
+ * Only jobs that point at this location's config table count; returns null when the group has none.
+ */
+async function readGroupJobSettings(ingestionGroup: string, configurationFqn: string): Promise<JobSettings | null> {
+  const name = jobName(ingestionGroup);
+  for await (const listed of workspace.jobs.list({ name, limit: 25, expand_tasks: false })) {
+    if (listed.settings?.name !== name || !listed.job_id) continue;
+    const job = await workspace.jobs.get({ job_id: listed.job_id });
+    const settings = job.settings;
+    const parameters = new Map((settings?.parameters ?? []).map((item) => [item.name, item.default]));
+    // Jobs with notebooks in the workspace have no git_source; the config table parameter identifies the location.
+    if (!settings || parameters.get('configuration_fqn') !== configurationFqn) continue;
+
+    const tasks = settings.tasks ?? [];
+    const pipelineId = tasks.find((task) => task.pipeline_task)?.pipeline_task?.pipeline_id;
+    const pipeline = pipelineId
+      ? await workspace.pipelines.get({ pipeline_id: pipelineId }).catch((error: unknown) => {
+          logger.warn('transfer.pipeline_unreadable', { ingestionGroup, pipelineId, error: serializeError(error) });
+          return undefined;
+        })
+      : undefined;
+    // A pipeline with the generated name was provisioned by SyncHole and is re-provisioned on import; any other
+    // pipeline was supplied by ID and is kept as is.
+    const generatedPipeline = pipeline?.name === cdcPipelineName(ingestionGroup);
+    const pipelineCluster =
+      pipeline?.spec?.clusters?.find((item) => item.label === 'default') ?? pipeline?.spec?.clusters?.[0];
+    const jobIdentity = job.run_as_user_name ?? runAsIdentity(settings.run_as) ?? job.creator_user_name;
+    const pipelineIdentity =
+      pipeline?.run_as_user_name ?? runAsIdentity(pipeline?.run_as) ?? pipeline?.creator_user_name;
+    return {
+      ingestionGroup,
+      notebooks: readNotebooks(
+        settings,
+        tasks.find((task) => task.task_key === 'ingestion_configs')?.notebook_task,
+        plannerNotebookPath
+      ),
+      library: readLibrary(readRequirement(settings)),
+      foreachConcurrency: tasks.find((task) => task.task_key === 'ingestion_worker')?.for_each_task?.concurrency ?? 1,
+      cdcPipelineId: pipelineId && !generatedPipeline ? pipelineId : null,
+      schedule: settings.schedule
+        ? {
+            enabled: true,
+            quartzCronExpression: settings.schedule.quartz_cron_expression,
+            timezoneId: settings.schedule.timezone_id,
+            pauseStatus: settings.schedule.pause_status ?? 'UNPAUSED',
+          }
+        : defaultSchedule,
+      compute: readJobCompute(settings),
+      pipelineCompute:
+        generatedPipeline && pipeline?.spec?.serverless === false
+          ? {
+              mode: 'CLASSIC',
+              nodeTypeId: pipelineCluster?.node_type_id ?? '',
+              driverNodeTypeId: pipelineCluster?.driver_node_type_id ?? pipelineCluster?.node_type_id ?? '',
+              minWorkers: pipelineCluster?.autoscale?.min_workers ?? pipelineCluster?.num_workers ?? 1,
+              maxWorkers: pipelineCluster?.autoscale?.max_workers ?? Math.max(pipelineCluster?.num_workers ?? 1, 1),
+              photon: pipeline.spec.photon ?? false,
+            }
+          : { mode: 'SERVERLESS', nodeTypeId: '', driverNodeTypeId: '', minWorkers: 1, maxWorkers: 4, photon: false },
+      runAs: {
+        job: runAsTarget(jobIdentity, job.creator_user_name),
+        // The run-as of a pipeline supplied by ID is not SyncHole's to set.
+        pipeline:
+          !generatedPipeline || pipelineIdentity === jobIdentity
+            ? { mode: 'SAME_AS_JOB', principal: '' }
+            : runAsTarget(pipelineIdentity, pipeline.creator_user_name),
+      },
+    };
+  }
+  return null;
+}
+
+/** Job settings of every listed group that has a generated job for this location. */
+export async function readJobSettings(catalog: string, schema: string, ingestionGroups: string[]) {
+  const configurationFqn = `${catalog}.${schema}.jdbc_ingestion_config`;
+  const result: JobSettings[] = [];
+  for (let offset = 0; offset < ingestionGroups.length; offset += 8) {
+    const batch = ingestionGroups.slice(offset, offset + 8);
+    const settings = await Promise.all(batch.map((group) => readGroupJobSettings(group, configurationFqn)));
+    result.push(...settings.filter((item) => item !== null));
+  }
+  return result;
+}

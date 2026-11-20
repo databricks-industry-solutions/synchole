@@ -1,0 +1,212 @@
+export type Location = { catalog: string; schema: string };
+export type Context = {
+  location: Location;
+  setLocation: (location: Location) => void;
+  revision: number;
+  refresh: () => void;
+};
+export type ConfigRow = {
+  ingestion_group: string;
+  source_table_name: string;
+  staging_table_fqn: string | null;
+  target_table_fqn: string;
+  ingestion_type: string;
+  key_columns: string | null;
+  watermark_column: string | null;
+  partition_column: string | null;
+  predicate_column: string | null;
+  change_tracking: string;
+  change_profile: string | null;
+  change_columns: string | null;
+  skip_change_time: boolean;
+  auto_cdc_from_snapshot: boolean;
+  jdbc_url: string | null;
+  jdbc_user: string | null;
+  jdbc_secret_scope: string | null;
+  jdbc_secret_key: string | null;
+  uc_secret_name: string | null;
+  connection_name: string | null;
+  connection_database: string | null;
+  watermark_threshold_minutes: number;
+  fetch_size: number;
+  num_partitions: number;
+  update_dttm: string | null;
+  enabled: boolean;
+};
+/** A change_tracking_profiles row, with how many source tables use it. */
+export type ProfileRow = {
+  profile_name: string;
+  description: string | null;
+  method: string;
+  change_table_name: string | null;
+  sequence_column: string | null;
+  delete_flag_column: string | null;
+  change_time_column: string | null;
+  procedure_call: string | null;
+  results_table: string | null;
+  update_dttm: string | null;
+  used_by: number | string;
+};
+export type WatermarkRow = {
+  ingestion_group: string;
+  source_table_name: string;
+  staging_table_fqn: string | null;
+  ingestion_type: string;
+  last_watermark: string | null;
+  last_run_timestamp: string | null;
+  status: string | null;
+  last_error: string | null;
+};
+export type JobRun = {
+  run_id?: number;
+  run_url?: string;
+  run_name?: string;
+  start_time?: number;
+  end_time?: number;
+  setup_duration?: number;
+  execution_duration?: number;
+  cleanup_duration?: number;
+  state?: { life_cycle_state?: string; result_state?: string; state_message?: string };
+};
+export type JobSchedule = {
+  quartz_cron_expression: string;
+  timezone_id: string;
+  pause_status?: 'PAUSED' | 'UNPAUSED';
+};
+export type JobRow = {
+  job_id?: number;
+  /** The ingestion group the job runs (GET /api/jobs lists the jobs of a page of groups). */
+  ingestion_group?: string;
+  settings?: {
+    name?: string;
+    schedule?: JobSchedule;
+  };
+  creator_user_name?: string;
+  created_time?: number;
+  workspace_url?: string;
+  runs: JobRun[];
+};
+export type SourceTable = { table_schema: string; table_name: string };
+export type SourceColumn = {
+  column_name: string;
+  data_type: string;
+  is_nullable: string;
+  ordinal_position: string;
+  is_primary_key: string;
+};
+export type TableDraft = {
+  table: SourceTable;
+  columns: SourceColumn[];
+  keyColumn: string;
+  watermarkColumn: string;
+  partitionColumn: string;
+  predicateColumn: string;
+  targetFqn: string;
+  stagingFqn: string;
+};
+/** Latest published SyncHole release, as returned by GET /api/latest-release. */
+export type LatestRelease = { version: string; name: string; notes: string; url: string; publishedAt: string | null };
+export type InferenceProgress = { completed: number; total: number };
+export type ImportGroupSummary = {
+  ingestionGroup: string;
+  configCount: number;
+  hasJobSettings: boolean;
+  /** The group's row check jobs in the file: basic, detailed. */
+  rowChecks: Array<'basic' | 'detailed'>;
+};
+export type ImportJobResult = {
+  ingestionGroup: string;
+  jobId?: number;
+  pipelineId?: string;
+  action?: 'created' | 'updated';
+  error?: string;
+};
+/** A row check job of the file: the location's (ingestionGroup '') or a group's. */
+export type ImportRowCheckJobResult = {
+  ingestionGroup: string;
+  checkMode: 'basic' | 'detailed';
+  jobId?: number;
+  name?: string;
+  action?: 'created' | 'updated';
+  error?: string;
+};
+export type ImportResult = {
+  dryRun: boolean;
+  configCount: number;
+  jobCount: number;
+  rowCheckJobCount: number;
+  groups: ImportGroupSummary[];
+  removedCount?: number;
+  jobs?: ImportJobResult[];
+  rowCheckJobs?: ImportRowCheckJobResult[];
+};
+export type RowCheckMode = 'basic' | 'detailed';
+export type RowCheckRun = {
+  runId?: number;
+  jobId: number;
+  runUrl?: string;
+  startTime?: number;
+  endTime?: number;
+  lifeCycleState?: string;
+  resultState?: string;
+  stateMessage?: string;
+  checkMode: RowCheckMode;
+  ingestionGroup: string;
+  sourceTableName: string;
+  rangeColumn: string;
+  rangeFrom: string;
+  rangeTo: string;
+};
+/** A job's compute, as the job APIs take it and read it back. */
+export type JobCompute = {
+  mode: 'SERVERLESS' | 'JOB_CLUSTER';
+  performanceTarget: 'STANDARD' | 'PERFORMANCE_OPTIMIZED';
+  sparkVersion: string;
+  driverNodeTypeId: string;
+  workerNodeTypeId: string;
+  minWorkers: number;
+  maxWorkers: number;
+};
+export type RunAsTarget = { mode: 'DEFAULT' | 'USER' | 'SERVICE_PRINCIPAL'; principal: string };
+/** A schedule as the job APIs take it and read it back. */
+export type Schedule = {
+  enabled: boolean;
+  quartzCronExpression: string;
+  timezoneId: string;
+  pauseStatus: 'PAUSED' | 'UNPAUSED';
+};
+/** Where a job's notebooks come from: a Git repository at a branch, tag or commit, or a workspace folder. */
+export type JobNotebooks =
+  | {
+      source: 'GIT';
+      gitUrl: string;
+      /** Null when detected from the URL; set for self-hosted Git servers. */
+      gitProvider: string | null;
+      referenceType: 'BRANCH' | 'TAG' | 'COMMIT';
+      reference: string;
+    }
+  | { source: 'WORKSPACE'; basePath: string };
+
+/** Where a job's tasks install SyncHole from: the notebooks' Git repository, a wheel file, or a pip requirement. */
+export type JobLibrary = { source: 'GIT' } | { source: 'WHEEL'; path: string } | { source: 'PIP'; requirement: string };
+
+/**
+ * A row check job, read back from the Databricks API (GET /api/row-checks/jobs). Each runs one check mode over
+ * the whole location (ingestionGroup '') or one group, and any of them can start a check from the app.
+ */
+export type RowCheckJob = {
+  jobId: number;
+  name: string;
+  workspaceUrl: string;
+  ingestionGroup: string;
+  checkMode: RowCheckMode;
+  /** A detailed check's range start, such as -30d; empty checks every row. */
+  rangeFrom: string;
+  notebooks: JobNotebooks;
+  library: JobLibrary;
+  maxParallelTables: number;
+  schedule: Schedule;
+  compute: JobCompute;
+  runAs: RunAsTarget;
+  runs: RowCheckRun[];
+};

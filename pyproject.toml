@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "synchole"
+version = "0.1.0"
+description = "Python package for JDBC ingestion, CDC SCD2 pipelines, and Databricks provisioning."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Emanuele Rinaldi" }]
+dependencies = [
+  "databricks-sdk>=0.120.0,<1",
+]
+
+[project.optional-dependencies]
+lakebase = ["psycopg2-binary>=2.9.9,<3"]
+zerobus = ["databricks-zerobus-ingest-sdk>=1.10.0,<2"]
+all = ["psycopg2-binary>=2.9.9,<3", "databricks-zerobus-ingest-sdk>=1.10.0,<2"]
+
+[project.scripts]
+synchole-plan-configs = "synchole.cli:plan_configs_main"
+synchole-run-ingestion = "synchole.cli:run_ingestion_main"
+synchole-row-check = "synchole.cli:row_check_main"
+synchole-create-job = "synchole.cli:create_job_main"
+synchole-import = "synchole.cli:import_config_main"
+synchole-setup-lakebase = "synchole.cli:setup_lakebase_main"
+synchole-setup-uc = "synchole.cli:setup_uc_main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+# Databricks notebooks rely on runtime globals (spark, dbutils, display).
+extend-exclude = ["notebooks", "tests/run_in_databricks.py", "app"]
+
+[tool.ruff.lint]
+# Correctness-only rules: syntax errors, undefined names, invalid comparisons.
+select = ["E9", "F63", "F7", "F82"]

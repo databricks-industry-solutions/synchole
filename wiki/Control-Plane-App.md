@@ -1,0 +1,89 @@
+# Control Plane App
+
+`app/synchole-control-plane` is a Databricks App (AppKit, React, TypeScript) for running SyncHole without writing SQL. It works on one metadata location (`<catalog>.<schema>`) at a time, picked on the first screen and changeable from the header. When you select a location, the app creates the schema and any missing metadata tables and columns there (see [Migrations](App-Development#migrations)).
+
+## Header
+
+The header shows the app version next to its name (hover it for the build time), the selected location (click it to switch catalog and schema) and two actions that apply to the
+whole location, available on every page:
+
+- **Export** downloads the location's configuration (source tables and job settings) as JSON.
+- **Import** loads such a file into the location, after validating it and showing a preview.
+
+See [Import and Export](Import-and-Export).
+
+### New release notice
+
+When a newer SyncHole release is published on GitHub, a warning triangle appears next to the version. Click it to
+read that release's notes and open it on GitHub. To update, redeploy the app from the new release.
+
+The app checks `https://api.github.com/repos/databricks-industry-solutions/synchole/releases/latest` from the
+server at most once an hour. If the workspace has no outbound internet access, or there is no newer release, no
+triangle is shown. See [App Development](App-Development#release-check) to point the check at another
+repository or turn it off.
+
+## Pages
+
+Every page has the same filter bar under its title: an **ingestion group**, up to 8 **picked tables** (a searchable list of the location's tables) and a **table-name search**. Everything on the page follows it, and the filtering runs on the SQL warehouse, so it works the same with thousands of tables. **Clear filters** resets it; each page keeps its own filters.
+
+Lists are paged on the SQL warehouse too: choose **10, 50 or 100 rows per page** (50 by default, remembered in the browser for every list) and move with the first, previous, next and last page buttons. Changing a filter goes back to the first page.
+
+| Page              | What it does                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Overview**      | For the filtered tables of the selected location, from each table's latest run in the watermark table (it keeps no run history): source and group counts, failed loads, tables not loaded within a chosen time (6 hours to 7 days, remembered per browser) or never, and the latest load. **Needs attention** lists the failed, never-loaded and stale tables with their last error, and ingestion jobs whose last run failed. **Source parity** sums up the latest basic row check and lists the tables most out of sync. **Groups** shows, a page of groups at a time and problems first, each group's loads, its ingestion job's last runs and its row check jobs. **Setup gaps** lists groups without an ingestion job or row check job, tables never loaded and groups with nothing enabled. |
+| **Configuration** | Add, edit and delete config rows. Discover source tables over a UC connection or a JDBC URL (SQL Server, Oracle, PostgreSQL, MySQL), optionally reading another database than the connection's (Oracle: service name), and infer key and watermark columns from primary-key constraints                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| **Watermarks**    | Inspect per-table state and schedule a full refresh for a single table (see [Full Refresh](CDC-Pipeline-and-Full-Refresh#full-refresh))                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| **Jobs**          | Create or update a group's job and CDC pipeline (see [below](#jobs-created-by-the-app)), run it incrementally or as a full refresh, and edit its schedule. Lists the job of each group with a matching table, a page of groups at a time; groups without a job yet get a button that opens the dialog for them. Only this location's generated jobs are shown, not every job in the workspace. Two views, remembered per browser: **Blocks** (a card per job, the default) and **List** (one table row per job, easier to scan when there are many). Both show each job's status, schedule and last 10 runs                                                                                                                                                                                       |
+| **Row checks**    | Create and edit the row check jobs, for the whole location or one group (see [Row check jobs](Row-Checks#row-check-jobs)), and compare each enabled source table with its target: a summary of the latest basic check (row counts), daily rows ingested and differences, and per-group then per-table results, all filtered by group, picked tables or table name. Detailed checks (per-chunk sums and hashes, then the rows of differing chunks) are started per table. See [Row Checks](Row-Checks#the-row-checks-page)                                                                                                                                                                                                                                                                         |
+
+## Deploying
+
+Deploy the app with the bundle in the repo root, then start it:
+
+```bash
+databricks bundle deploy -t dev-app            # or -t prod-app
+databricks bundle run synchole_control_plane -t dev-app
+```
+
+The `-app` targets deploy the code as well; the `dev` and `prod` targets deploy only the code (see [Bundle Deployment](Bundle-Deployment)). The app uses the SQL warehouse named `Shared Unity Catalog Serverless`. Pass `--var warehouse_id=<sql-warehouse-id>` to use another one. You can also deploy from the Databricks UI: clone the repo into your workspace, open the Asset Bundle editor, and click **Deploy**.
+
+The app runs as its own service principal. That principal needs write access to the metadata schemas, permission to create jobs and pipelines, and access to the UC connections and secret scopes the configs reference.
+
+## Jobs created by the app
+
+The **Jobs** dialog builds one job per ingestion group, named `[<group>] Ingestion Pipeline`. If a job with that name exists, it is updated in place. The dialog has these tabs:
+
+| Tab                    | Settings                                                                                                                                                                                                                                                                                                  |
+| ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Job configuration**  | The ingestion group; shows the generated job parameters                                                                                                                                                                                                                                                   |
+| **Source & execution** | Where the notebooks come from and where SyncHole is installed from (see [below](#notebooks-and-package)), parallel tables (`foreach_concurrency`, 1–100), and optionally an existing SDP pipeline ID to reuse                                                                                            |
+| **Job Compute**        | **Serverless** (default) with a performance mode (`PERFORMANCE_OPTIMIZED` by default, or `STANDARD`, which costs less but can wait minutes for compute), or a **shared autoscaling job cluster** (Databricks Runtime, driver and worker node types, min/max workers) used by the planner and every worker |
+| **SDP Compute**        | Shown when the group has a CDC pipeline: **Serverless** (default), sharing the job's performance mode, or a **classic autoscaling cluster** (node types, min/max workers, Photon)                                                                                                                         |
+| **Schedule**           | Quartz cron expression, time zone, active or paused; or manual runs only                                                                                                                                                                                                                                  |
+| **Run as**             | The job runs as its owner (the app service principal, default), a user, or a service principal. The SDP pipeline follows the job (default) or uses its own identity                                                                                                                                       |
+
+- Node type fields are prefilled with the smallest general-purpose node type with at least 4 cores (`GET /api/node-types`). Other node types are offered as suggestions.
+- If a required field is missing on a tab you are not viewing, the dialog switches to that tab and names the field.
+
+### Notebooks and package
+
+A job needs two things from SyncHole: the task **notebooks** it runs, and the **package** its tasks and the group's SDP pipeline install. On the **Source & execution** tab each is a choice, and only the fields of the chosen option are shown. The [row check job](Row-Checks#row-check-jobs) dialog has the same choices.
+
+| Notebooks from       | Fields                                        | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| -------------------- | --------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Git repository**   | URL, and a branch, a tag or a commit          | GitHub, Azure DevOps (`dev.azure.com`), GitLab, Bitbucket Cloud and AWS CodeCommit are recognised from the URL; for a self-hosted server (GitHub Enterprise Server, GitLab Self-Managed, Bitbucket Data Center), choose its provider. A user name in the URL, such as the `org@` of Azure DevOps clone URLs, is dropped. A private repository needs Git credentials for the identity the job runs as. A tag or a commit pins the run to that version |
+| **Workspace folder** | The folder that holds `notebooks/` and `src/` | A bundle's deployed files (`.../.bundle/<name>/<target>/files`) or a Git folder. The job has no Git source, so no Git credentials are needed                                                                                                                                                                                                                                                                                                         |
+
+| Install SyncHole from | Fields      | Notes                                                                                                                                                                                                                     |
+| ---------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Git repository**     | —           | The package from the notebooks' repository and reference, for example `synchole@git+<url>.git@<branch>`. pip reads it without credentials, so it only works for a public repository. Not offered for workspace notebooks |
+| **Wheel file**         | Path        | A wheel in a Unity Catalog volume, or in the workspace, where a bundle deploys the one it builds. Use a wheel built from the same version as the notebooks                                                                |
+| **Pip requirement**    | Requirement | For example `synchole==0.4.0` from PyPI or the workspace's default package repository (such as an Azure Artifacts feed, set up by an admin), or a wheel URL                                                              |
+
+Serverless tasks and the SDP pipeline install the package through their environment; job cluster tasks install it as a library (`whl` for a wheel, `pypi` otherwise). Git references, paths and requirements must not contain quotes or backslashes, because they end up in a pip requirement.
+
+- The CDC pipeline is named `[<group>] CDC SCD2 Pipeline` and is created or updated with the job. Serverless pipelines install the package through the pipeline environment. Classic pipelines run on the **Advanced** edition (Auto CDC needs at least Pro) and use a per-group notebook in `/Shared/synchole-generated-pipelines` that installs the package with `%pip`.
+- Databricks keeps one serverless performance mode per job, and it covers the SDP pipeline task too, so the job and its pipeline always run with the same mode. The dialog lets you edit it in one place: on **Job Compute** when the job is serverless (**SDP Compute** then shows it read-only, with a button to go there), otherwise on **SDP Compute** when only the pipeline is serverless. It is sent whenever the job compute or the SDP pipeline is serverless.
+- Running as a user requires the app service principal to be a workspace admin. Running as another service principal requires it to have the Service Principal User role on that principal. The SDP run-as setting is ignored when you reuse an existing pipeline by ID.
+
+See [App Development](App-Development) for local development, the API routes and migrations.

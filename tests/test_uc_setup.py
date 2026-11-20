@@ -1,0 +1,73 @@
+from __future__ import annotations
+
+import types
+import unittest
+
+from synchole.utils.uc_setup import UnityCatalogSetup
+
+
+class FakeSpark:
+    def __init__(self, existing_config_columns: list[str]) -> None:
+        self.statements: list[str] = []
+        self.existing_config_columns = existing_config_columns
+
+    def sql(self, statement: str):
+        self.statements.append(statement)
+        return types.SimpleNamespace(collect=lambda: [])
+
+    def table(self, _name: str):
+        fields = [types.SimpleNamespace(name=name) for name in self.existing_config_columns]
+        return types.SimpleNamespace(schema=types.SimpleNamespace(fields=fields))
+
+
+class UnityCatalogSetupTest(unittest.TestCase):
+    def test_config_table_includes_uc_secret_name(self) -> None:
+        spark = FakeSpark(existing_config_columns=[])
+        UnityCatalogSetup(spark, catalog="main", schema="synchole").create_config_table()
+        self.assertIn("uc_secret_name STRING", spark.statements[0])
+
+    def test_existing_config_table_gets_uc_secret_name_added(self) -> None:
+        spark = FakeSpark(existing_config_columns=["ingestion_group", "source_table_name"])
+        UnityCatalogSetup(spark, catalog="main", schema="synchole").create_config_table()
+        alter = [statement for statement in spark.statements if statement.startswith("ALTER TABLE")]
+        self.assertEqual(len(alter), 1)
+        self.assertIn("uc_secret_name STRING", alter[0])
+
+    def test_config_table_includes_connection_database(self) -> None:
+        spark = FakeSpark(existing_config_columns=[])
+        UnityCatalogSetup(spark, catalog="main", schema="synchole").create_config_table()
+        self.assertIn("connection_database STRING", spark.statements[0])
+
+    def test_existing_config_table_gets_connection_database_added(self) -> None:
+        spark = FakeSpark(existing_config_columns=["ingestion_group", "source_table_name", "uc_secret_name"])
+        UnityCatalogSetup(spark, catalog="main", schema="synchole").create_config_table()
+        alter = [statement for statement in spark.statements if statement.startswith("ALTER TABLE")]
+        self.assertEqual(len(alter), 1)
+        self.assertIn("connection_database STRING", alter[0])
+
+    def test_config_table_includes_change_tracking_columns(self) -> None:
+        spark = FakeSpark(existing_config_columns=[])
+        UnityCatalogSetup(spark, catalog="main", schema="synchole").create_config_table()
+        self.assertIn("change_tracking STRING", spark.statements[0])
+        self.assertIn("change_profile STRING", spark.statements[0])
+        self.assertIn("change_columns STRING", spark.statements[0])
+        self.assertIn("skip_change_time BOOLEAN", spark.statements[0])
+
+    def test_profiles_table_is_created_next_to_the_config_table(self) -> None:
+        spark = FakeSpark(existing_config_columns=[])
+        setup = UnityCatalogSetup(spark, catalog="main", schema="synchole")
+        setup.create_profiles_table()
+        self.assertEqual(setup.profiles_table, "main.synchole.change_tracking_profiles")
+        self.assertIn("CREATE TABLE IF NOT EXISTS IDENTIFIER('main.synchole.change_tracking_profiles')", spark.statements[0])
+        for column in ("profile_name STRING", "method STRING", "change_table_name STRING", "procedure_call STRING"):
+            self.assertIn(column, spark.statements[0])
+
+    def test_watermark_table_is_not_replaced(self) -> None:
+        spark = FakeSpark(existing_config_columns=[])
+        UnityCatalogSetup(spark, catalog="main", schema="synchole").create_watermark_state_table()
+        self.assertIn("CREATE TABLE IF NOT EXISTS", spark.statements[0])
+        self.assertNotIn("CREATE OR REPLACE", spark.statements[0])
+
+
+if __name__ == "__main__":
+    unittest.main()
